@@ -1,5 +1,52 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>数字凭证服务</title>
-<style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}</style>
-<h1>数字凭证签发与验证</h1><p>通过 JSON API 完成模板创建、签发、最少披露、验证和撤销。身份由 <code>X-Actor</code> 与 <code>X-Role</code> 请求头模拟。</p><button onclick="loadState()">刷新状态</button><pre id="state">加载中...</pre>
-<script>async function loadState(){state.textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}loadState()</script>
+<style>
+body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}
+pre{background:#f3f5f7;padding:16px;overflow:auto}
+button{padding:8px 14px}
+h2{margin-top:36px}
+table{border-collapse:collapse;width:100%;margin-bottom:24px}
+th,td{border:1px solid #d5dade;padding:8px 10px;text-align:left;font-size:14px}
+th{background:#eef1f4}
+.status{font-weight:600}
+.status-pending{color:#9a6700}.status-withdrawn{color:#57606a}.status-effective{color:#b3261e}
+</style>
+<h1>数字凭证签发与验证</h1>
+<p>通过 JSON API 完成模板创建、签发、最少披露、验证和撤销。撤证决定可预约夜间生效：登记后白天核验仍返回原结论并注明失效时间，到点后才按撤销处理。身份由 <code>X-Actor</code> 与 <code>X-Role</code> 请求头模拟。</p>
+<button onclick="loadAll()">刷新</button>
+
+<h2>预约撤证记录</h2>
+<div id="appointments">加载中...</div>
+
+<h2>全部状态（原始 JSON）</h2>
+<pre id="state">加载中...</pre>
+<script>
+function esc(v){return String(v==null?'':v).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function apptTable(title, cls, rows){
+  let body = rows.map(a=>`<tr>
+    <td>${esc(a.id)}</td><td>${esc(a.credential_id)}</td><td>${esc(a.holder_id)}</td>
+    <td>${esc(a.reason)}</td><td>${esc(a.effective_at)}</td>
+    <td>${esc(a.created_by)}</td><td>${esc(a.created_at)}</td>
+    <td>${esc(a.withdrawn_by||'')}</td><td>${esc(a.withdrawn_at||a.applied_at||'')}</td>
+  </tr>`).join('')
+  if(!rows.length) body = '<tr><td colspan="9" style="color:#57606a">暂无记录</td></tr>'
+  return `<h3>${title}（${rows.length}）</h3><table><thead><tr>
+    <th>预约号</th><th>凭证</th><th>持有人</th><th>原因</th><th>生效时间</th>
+    <th>登记人</th><th>登记时间</th><th>撤回人</th><th>撤回/生效时间</th>
+  </tr></thead><tbody class="${cls}">${body}</tbody></table>`
+}
+async function renderAppointments(){
+  const data = await (await fetch('/api/revocation-appointments')).json()
+  const all = data.revocation_appointments || []
+  const pending = all.filter(a=>a.status==='pending')
+  const withdrawn = all.filter(a=>a.status==='withdrawn')
+  const effective = all.filter(a=>a.status==='effective')
+  appointments.innerHTML =
+    apptTable('待生效','status-pending',pending) +
+    apptTable('已撤回','status-withdrawn',withdrawn) +
+    apptTable('已生效','status-effective',effective)
+}
+async function loadState(){state.textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}
+async function loadAll(){await Promise.all([renderAppointments(),loadState()])}
+loadAll()
+</script>
 </html>

@@ -45,6 +45,173 @@ class ApiError(Exception):
         self.message = message
 
 
+APPOINTMENT_STATUS_LABELS = {"pending": "待生效", "withdrawn": "已撤回", "effective": "已生效"}
+
+
+def appointment_view(row: sqlite3.Row) -> dict:
+    """Display-only projection of a revocation appointment (page/API serialization)."""
+    columns = row.keys()
+    status = row["status"]
+    return {
+        "id": row["id"],
+        "credential_id": row["credential_id"],
+        "holder_id": row["holder_id"] if "holder_id" in columns else None,
+        "issuer": row["issuer"],
+        "reason": row["reason"],
+        "effective_at": row["effective_at"],
+        "status": status,
+        "status_label": APPOINTMENT_STATUS_LABELS[status],
+        "created_by": row["created_by"],
+        "created_at": row["created_at"],
+        "withdrawn_by": row["withdrawn_by"],
+        "withdrawn_at": row["withdrawn_at"],
+        "applied_at": row["applied_at"],
+    }
+
+
+class RevocationScheduler:
+    """Scheduled revocations: appointment registration and point-in-time decisions."""
+
+    def __init__(self, store: "Store", credentials: "CredentialService"):
+        self.store = store
+        self.conn = store.conn
+        self.credentials = credentials
+
+    def _appointment(self, appointment_id: int) -> sqlite3.Row:
+        row = self.conn.execute("SELECT * FROM revocation_appointments WHERE id=?", (appointment_id,)).fetchone()
+        if not row:
+            raise ApiError(404, "撤证预约不存在")
+        return row
+
+    def _view(self, appointment_id: int) -> dict:
+        row = self.conn.execute(
+            """SELECT a.*, c.holder_id FROM revocation_appointments a
+               LEFT JOIN credentials c ON c.id=a.credential_id WHERE a.id=?""",
+            (appointment_id,),
+        ).fetchone()
+        if not row:
+            raise ApiError(404, "撤证预约不存在")
+        return appointment_view(row)
+
+    def pending_for(self, credential_id: int) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM revocation_appointments WHERE credential_id=? AND status='pending'", (credential_id,)
+        ).fetchone()
+
+    def schedule(self, actor: str | None, role: str | None, credential_id: int, reason: str, effective_at: str | None) -> dict:
+        actor = CredentialService._required_actor(actor, role, "issuer")
+        reason = str(reason or "").strip()
+        if not reason:
+            raise ApiError(400, "撤证原因不能为空")
+        if not effective_at:
+            raise ApiError(400, "撤证预约需要登记生效时间")
+        try:
+            effective = parse_time(str(effective_at))
+        except ValueError as exc:
+            raise ApiError(400, "生效时间格式无效") from exc
+        if effective <= now():
+            raise ApiError(400, "预约生效时间必须晚于当前时间")
+        credential = self.credentials._row("credentials", credential_id)
+        if credential["issuer"] != actor:
+            raise ApiError(403, "只能预约撤销本机构签发的凭证")
+        self.apply_due()
+        credential = self.conn.execute("SELECT status FROM credentials WHERE id=?", (credential_id,)).fetchone()
+        if credential["status"] != "active":
+            raise ApiError(409, f"凭证当前状态为 {credential['status']}，不能预约撤销")
+        if self.pending_for(credential_id):
+            raise ApiError(409, "同一凭证只允许一条未结撤证预约")
+        try:
+            with self.conn:
+                cur = self.conn.execute(
+                    """INSERT INTO revocation_appointments(credential_id,issuer,reason,effective_at,status,created_by,created_at)
+                       VALUES(?,?,?,?,'pending',?,?)""",
+                    (credential_id, actor, reason, iso(effective), actor, iso()),
+                )
+                self.store.audit(
+                    actor, "revocation_appointment.schedule", "revocation_appointment", cur.lastrowid,
+                    {"credential_id": credential_id, "reason": reason, "effective_at": iso(effective)},
+                )
+        except sqlite3.IntegrityError as exc:
+            raise ApiError(409, "同一凭证只允许一条未结撤证预约") from exc
+        return self._view(cur.lastrowid)
+
+    def withdraw(self, actor: str | None, role: str | None, appointment_id: int) -> dict:
+        actor = CredentialService._required_actor(actor, role, "issuer")
+        appointment = self._appointment(appointment_id)
+        if appointment["issuer"] != actor:
+            raise ApiError(403, "只能撤回本机构登记的撤证预约")
+        if appointment["status"] != "pending":
+            raise ApiError(409, "只能撤回待生效的撤证预约")
+        # The appointment may have crossed its effective time since it was read.
+        self.apply_due()
+        appointment = self._appointment(appointment_id)
+        if appointment["status"] != "pending":
+            raise ApiError(409, "撤证已到生效时间，无法撤回")
+        with self.conn:
+            self.conn.execute(
+                "UPDATE revocation_appointments SET status='withdrawn',withdrawn_by=?,withdrawn_at=? WHERE id=?",
+                (actor, iso(), appointment_id),
+            )
+            self.store.audit(
+                actor, "revocation_appointment.withdraw", "revocation_appointment", appointment_id,
+                {"credential_id": appointment["credential_id"]},
+            )
+        return self._view(appointment_id)
+
+    def apply_due(self, at: datetime | None = None) -> list[dict]:
+        """Credential write path: turn pending appointments whose time has come into revocations."""
+        moment = at or now()
+        due = self.conn.execute(
+            "SELECT * FROM revocation_appointments WHERE status='pending' AND effective_at<=? ORDER BY effective_at",
+            (iso(moment),),
+        ).fetchall()
+        applied: list[dict] = []
+        for appointment in due:
+            with self.conn:
+                credential = self.conn.execute(
+                    "SELECT status FROM credentials WHERE id=?", (appointment["credential_id"],)
+                ).fetchone()
+                if credential and credential["status"] == "active":
+                    self.credentials.write_revocation(
+                        appointment["credential_id"], appointment["reason"], parse_time(appointment["effective_at"])
+                    )
+                self.conn.execute(
+                    "UPDATE revocation_appointments SET status='effective',applied_at=? WHERE id=?",
+                    (iso(), appointment["id"]),
+                )
+                self.store.audit(
+                    appointment["created_by"], "revocation_appointment.effective", "revocation_appointment",
+                    appointment["id"],
+                    {"credential_id": appointment["credential_id"], "effective_at": appointment["effective_at"]},
+                )
+            applied.append(self._view(appointment["id"]))
+        return applied
+
+    def effect_for(self, credential: sqlite3.Row, check_at: datetime) -> dict | None:
+        """Point-in-time determination: what revocation conclusion applies at check_at."""
+        if credential["status"] == "revoked":
+            return {
+                "reason": credential["revocation_reason"],
+                "effective_at": parse_time(credential["revocation_effective_at"]),
+            }
+        appointment = self.pending_for(credential["id"])
+        if appointment:
+            return {
+                "reason": appointment["reason"],
+                "effective_at": parse_time(appointment["effective_at"]),
+                "appointment_id": appointment["id"],
+            }
+        return None
+
+    def list_views(self) -> list[dict]:
+        self.apply_due()
+        rows = self.conn.execute(
+            """SELECT a.*, c.holder_id FROM revocation_appointments a
+               LEFT JOIN credentials c ON c.id=a.credential_id ORDER BY a.id DESC"""
+        ).fetchall()
+        return [appointment_view(row) for row in rows]
+
+
 class Store:
     def __init__(self, path: str | os.PathLike[str] = DB_PATH):
         self.path = str(path)
@@ -106,6 +273,22 @@ class Store:
               created_at TEXT NOT NULL,
               resolved_at TEXT
             );
+            CREATE TABLE IF NOT EXISTS revocation_appointments (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              credential_id INTEGER NOT NULL REFERENCES credentials(id),
+              issuer TEXT NOT NULL,
+              reason TEXT NOT NULL,
+              effective_at TEXT NOT NULL,
+              status TEXT NOT NULL CHECK(status IN ('pending','withdrawn','effective')),
+              created_by TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              withdrawn_by TEXT,
+              withdrawn_at TEXT,
+              applied_at TEXT
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS one_pending_appointment
+              ON revocation_appointments(credential_id)
+              WHERE status='pending';
             CREATE TABLE IF NOT EXISTS audit_log (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               at TEXT NOT NULL,
@@ -135,6 +318,14 @@ class CredentialService:
     def __init__(self, store: Store):
         self.store = store
         self.conn = store.conn
+        self.scheduler = RevocationScheduler(store, self)
+
+    def write_revocation(self, credential_id: int, reason: str, effective: datetime) -> None:
+        """Single credential write path for revocation; shared by immediate and scheduled flows."""
+        self.conn.execute(
+            "UPDATE credentials SET status='revoked',revocation_reason=?,revocation_effective_at=? WHERE id=? AND status='active'",
+            (reason, iso(effective), credential_id),
+        )
 
     @staticmethod
     def _required_actor(actor: str | None, role: str | None, expected: str) -> str:
@@ -221,6 +412,7 @@ class CredentialService:
         unknown = sorted(set(claims) - {f["name"] for f in fields})
         if missing or unknown:
             raise ApiError(400, f"声明不完整，缺少={missing}，未知字段={unknown}")
+        self.scheduler.apply_due()
         live = self.conn.execute(
             "SELECT id FROM credentials WHERE template_id=? AND holder_id=? AND status IN ('active','disputed')",
             (template_id, holder_id),
@@ -246,19 +438,22 @@ class CredentialService:
 
     def revoke(self, actor: str | None, role: str | None, credential_id: int, reason: str, effective_at: str | None = None) -> dict:
         actor = self._required_actor(actor, role, "issuer")
+        if not str(reason or "").strip():
+            raise ApiError(400, "撤证原因不能为空")
         credential = self._row("credentials", credential_id)
         if credential["issuer"] != actor:
             raise ApiError(403, "只能撤销本机构签发的凭证")
+        self.scheduler.apply_due()
+        credential = self._row("credentials", credential_id)
         if credential["status"] == "revoked":
             if credential["revocation_reason"] == reason:
                 return self._credential_dict(credential)
             raise ApiError(409, "凭证已经撤销")
+        if self.scheduler.pending_for(credential_id):
+            raise ApiError(409, "该凭证存在待生效的撤证预约，请先撤回预约；预约到夜间生效请使用撤证预约接口")
         effective = parse_time(effective_at) if effective_at else now()
         with self.conn:
-            self.conn.execute(
-                "UPDATE credentials SET status='revoked',revocation_reason=?,revocation_effective_at=? WHERE id=?",
-                (reason, iso(effective), credential_id),
-            )
+            self.write_revocation(credential_id, reason, effective)
             self.store.audit(actor, "credential.revoke", "credential", credential_id, {"reason": reason, "effective_at": iso(effective)})
         return self._credential_dict(self._row("credentials", credential_id))
 
@@ -267,6 +462,8 @@ class CredentialService:
         credential = self._row("credentials", credential_id)
         if credential["holder_id"] != actor:
             raise ApiError(403, "只能对自己的凭证提出争议")
+        self.scheduler.apply_due()
+        credential = self._row("credentials", credential_id)
         if credential["status"] != "revoked":
             raise ApiError(409, "只有已撤销凭证可以提出争议")
         open_dispute = self.conn.execute("SELECT id FROM disputes WHERE credential_id=? AND status='open'", (credential_id,)).fetchone()
@@ -350,17 +547,24 @@ class CredentialService:
             raise ApiError(400, "凭证签名无效")
         check_at = parse_time(at)
         expiration = parse_time(credential["valid_until"])
+        # Materialize appointments due by the current wall clock before deciding.
+        self.scheduler.apply_due()
+        credential = self._row("credentials", int(payload.get("credential_id", 0)))
         result = {"valid": True, "status": "valid", "key_retired": key["status"] == "retired", "claims": payload.get("claims", {})}
         if check_at >= expiration:
             result.update(valid=False, status="expired", reason="凭证已过期")
         elif credential["status"] == "disputed":
             result.update(valid=False, status="disputed", reason="撤销决定正在争议复核")
-        elif credential["status"] == "revoked":
-            effective = parse_time(credential["revocation_effective_at"])
-            if check_at >= effective:
-                result.update(valid=False, status="revoked", reason=credential["revocation_reason"])
-            else:
-                result.update(status="valid_until_revocation", revocation_starts_at=credential["revocation_effective_at"])
+        else:
+            effect = self.scheduler.effect_for(credential, check_at)
+            if effect and check_at >= effect["effective_at"]:
+                result.update(valid=False, status="revoked", reason=effect["reason"])
+            elif effect:
+                result.update(
+                    status="valid_until_revocation",
+                    revocation_starts_at=iso(effect["effective_at"]),
+                    revocation_reason=effect["reason"],
+                )
         if not online:
             result["offline"] = True
             result["revocation_freshness"] = "needs_online_check"
@@ -377,11 +581,15 @@ class CredentialService:
             "revocation_effective_at": row["revocation_effective_at"],
         }
 
+    def appointments(self) -> list[dict]:
+        return self.scheduler.list_views()
+
     def state(self) -> dict:
+        self.scheduler.apply_due()
         credentials = [self._credential_dict(row) for row in self.conn.execute("SELECT * FROM credentials ORDER BY id DESC")]
         templates = [dict(row) for row in self.conn.execute("SELECT id,issuer,code,name,status,validity_days FROM templates ORDER BY id DESC")]
         audits = [dict(row) for row in self.conn.execute("SELECT at,actor,action,entity_type,entity_id,details_json FROM audit_log ORDER BY id DESC LIMIT 30")]
-        return {"templates": templates, "credentials": credentials, "audits": audits}
+        return {"templates": templates, "credentials": credentials, "revocation_appointments": self.appointments(), "audits": audits}
 
     def seed(self) -> None:
         if not self.conn.execute("SELECT id FROM key_versions LIMIT 1").fetchone():
@@ -423,6 +631,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"status": "ok"})
             if parts == ["api", "state"]:
                 return self._json(200, self.service.state())
+            if parts == ["api", "revocation-appointments"]:
+                return self._json(200, {"revocation_appointments": self.service.appointments()})
             if not parts:
                 page = (Path(__file__).parent / "static" / "index.html").read_bytes()
                 self.send_response(200)
@@ -450,6 +660,12 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.service.issue(actor, role, int(body.get("template_id", 0)), body.get("holder_id", ""), body.get("claims", {}), body.get("idempotency_key", ""), body.get("valid_until"))
             elif len(parts) == 4 and parts[:2] == ["api", "credentials"] and parts[3] == "revoke":
                 result = self.service.revoke(actor, role, int(parts[2]), body.get("reason", ""), body.get("effective_at"))
+            elif len(parts) == 5 and parts[:2] == ["api", "credentials"] and parts[3] == "revocation-appointments":
+                if parts[4] != "schedule":
+                    raise ApiError(404, "接口不存在")
+                result = self.service.scheduler.schedule(actor, role, int(parts[2]), body.get("reason", ""), body.get("effective_at"))
+            elif len(parts) == 4 and parts[:2] == ["api", "revocation-appointments"] and parts[3] == "withdraw":
+                result = self.service.scheduler.withdraw(actor, role, int(parts[2]))
             elif len(parts) == 4 and parts[:2] == ["api", "credentials"] and parts[3] == "dispute":
                 result = self.service.dispute(actor, role, int(parts[2]), body.get("reason", ""))
             elif len(parts) == 4 and parts[:2] == ["api", "credentials"] and parts[3] == "present":
