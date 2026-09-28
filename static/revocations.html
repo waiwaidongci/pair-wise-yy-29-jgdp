@@ -1,0 +1,54 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>撤销预约</title>
+<style>
+body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}
+pre{background:#f3f5f7;padding:16px;overflow:auto}
+button{padding:6px 12px}
+section{margin:24px 0}
+h2{border-bottom:2px solid #d8dee4;padding-bottom:6px}
+table{border-collapse:collapse;width:100%;font-size:14px}
+th,td{border:1px solid #d8dee4;padding:6px 8px;text-align:left;vertical-align:top}
+th{background:#eef1f4}
+.bar{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+.muted{color:#666}
+a{margin-right:12px}
+</style>
+<h1>撤销预约</h1>
+<p class="muted">到点前核验仍返回原有结论并注明失效时间；到点后才按撤销处理。生效前可撤回，原凭证照常使用。撤回操作以签发方身份执行：</p>
+<p class="bar">
+  签发方 <input id="actor" value="issuer-demo">
+  <button onclick="load()">刷新</button>
+  <a href="/">返回总览</a>
+</p>
+<section><h2>待生效</h2><table id="pending"><thead><tr><th>预约</th><th>凭证</th><th>持有人</th><th>原因</th><th>生效时间</th><th>登记时间</th><th>操作</th></tr></thead><tbody></tbody></table></section>
+<section><h2>已撤回</h2><table id="withdrawn"><thead><tr><th>预约</th><th>凭证</th><th>持有人</th><th>原因</th><th>生效时间</th><th>撤回时间</th><th>撤回人</th></tr></thead><tbody></tbody></table></section>
+<section><h2>已生效</h2><table id="effective"><thead><tr><th>预约</th><th>凭证</th><th>持有人</th><th>原因</th><th>生效时间</th><th>实际处理时间</th></tr></thead><tbody></tbody></table></section>
+<pre id="error" hidden></pre>
+<script>
+const STATUS_CN={pending:'待生效',withdrawn:'已撤回',effective:'已生效'};
+function esc(v){return String(v??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function row(a,withdraw){
+  const action=withdraw?`<button onclick="withdrawAppointment(${a.id})">撤回</button>`:'';
+  return `<tr><td>${a.id}</td><td>${a.credential_id}</td><td>${esc(a.holder_id)}</td><td>${esc(a.reason)}</td><td>${esc(a.effective_at)}</td><td>${esc(a.withdrawn_at||a.created_at)}</td><td>${esc(a.withdrawn_by||a.applied_at||'')}${action?'<br>'+action:''}</td></tr>`;
+}
+function fill(id,list,withdraw){
+  document.querySelector(`#${id} tbody`).innerHTML=list.map(a=>row(a,withdraw)).join('')||'<tr><td colspan="7" class="muted">暂无记录</td></tr>';
+}
+async function load(){
+  error.hidden=true;
+  try{
+    const [p,w,e]=await Promise.all(['pending','withdrawn','effective'].map(s=>fetch('/api/revocation-appointments?status='+s).then(r=>r.json())));
+    fill('pending',p.revocation_appointments||[],true);
+    fill('withdrawn',w.revocation_appointments||[],false);
+    fill('effective',e.revocation_appointments||[],false);
+  }catch(err){error.hidden=false;error.textContent=String(err)}
+}
+async function withdrawAppointment(id){
+  error.hidden=true;
+  const resp=await fetch(`/api/revocation-appointments/${id}/withdraw`,{method:'POST',headers:{'X-Actor':actor.value,'X-Role':'issuer'}});
+  const body=await resp.json();
+  if(!resp.ok){error.hidden=false;error.textContent=JSON.stringify(body,null,2);return}
+  load();
+}
+load();
+</script>
+</html>
